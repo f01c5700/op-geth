@@ -157,6 +157,8 @@ var (
 		utils.RollupSequencerHTTPFlag,
 		utils.RollupHistoricalRPCFlag,
 		utils.RollupHistoricalRPCTimeoutFlag,
+		utils.RollupInteropRPCFlag,
+		utils.RollupInteropRPCTimeoutFlag,
 		utils.RollupDisableTxPoolGossipFlag,
 		utils.RollupComputePendingBlock,
 		utils.RollupHaltOnIncompatibleProtocolVersionFlag,

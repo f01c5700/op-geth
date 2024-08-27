@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/interoptypes"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/log"
@@ -66,6 +67,9 @@ type environment struct {
 	receipts []*types.Receipt
 	sidecars []*types.BlobTxSidecar
 	blobs    int
+
+	noTxs  bool            // true if we are reproducing a block, and do not have to check interop txs
+	rpcCtx context.Context // context to control block-building RPC work. No RPC allowed if nil.
 }
 
 const (
@@ -101,6 +105,8 @@ type generateParams struct {
 	gasLimit  *uint64            // Optional gas limit override
 	interrupt *atomic.Int32      // Optional interruption signal to pass down to worker.generateWork
 	isUpdate  bool               // Optional flag indicating that this is building a discardable update
+
+	rpcCtx context.Context // context to control block-building RPC work. No RPC allowed if nil.
 }
 
 // generateWork generates a sealing block based on the given parameters.
@@ -241,11 +247,12 @@ func (miner *Miner) prepareWork(genParams *generateParams) (*environment, error)
 	// Could potentially happen if starting to mine in an odd state.
 	// Note genParams.coinbase can be different with header.Coinbase
 	// since clique algorithm can modify the coinbase field in header.
-	env, err := miner.makeEnv(parent, header, genParams.coinbase)
+	env, err := miner.makeEnv(parent, header, genParams.coinbase, genParams.rpcCtx)
 	if err != nil {
 		log.Error("Failed to create sealing context", "err", err)
 		return nil, err
 	}
+	env.noTxs = genParams.noTxs
 	if header.ParentBeaconRoot != nil {
 		context := core.NewEVMBlockContext(header, miner.chain, nil, miner.chainConfig, env.state)
 		vmenv := vm.NewEVM(context, vm.TxContext{}, env.state, miner.chainConfig, vm.Config{})
@@ -255,7 +262,7 @@ func (miner *Miner) prepareWork(genParams *generateParams) (*environment, error)
 }
 
 // makeEnv creates a new environment for the sealing block.
-func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address) (*environment, error) {
+func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address, rpcCtx context.Context) (*environment, error) {
 	// Retrieve the parent state to execute on top.
 	state, err := miner.chain.StateAt(parent.Root)
 	if err != nil {
@@ -280,6 +287,7 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 		state:    state,
 		coinbase: coinbase,
 		header:   header,
+		rpcCtx:   rpcCtx,
 	}, nil
 }
 
@@ -329,11 +337,39 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 		gp   = env.gasPool.Gas()
 	)
 	receipt, err := core.ApplyTransaction(miner.chainConfig, miner.chain, &env.coinbase, env.gasPool, env.state, env.header, tx, &env.header.GasUsed, vm.Config{})
+	// If successful, and not just reproducing the block, check the interop executing messages.
+	if err == nil && !env.noTxs && miner.chain.Config().IsInterop(env.header.Time) {
+		err = miner.checkInterop(env.rpcCtx, receipt)
+	}
 	if err != nil {
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.SetGas(gp)
 	}
 	return receipt, err
+}
+
+func (miner *Miner) checkInterop(ctx context.Context, receipt *types.Receipt) error {
+	b, ok := miner.backend.(BackendWithInterop)
+	if !ok {
+		return fmt.Errorf("cannot mine interop txs without interop backend, got backend type %T", miner.backend)
+	}
+	var executingMessages []interoptypes.Message
+	for _, l := range receipt.Logs {
+		if l.Address == params.InteropCrossL2InboxAddress {
+			var msg interoptypes.Message
+			if err := msg.DecodeEvent(l.Topics, l.Data); err != nil {
+				return fmt.Errorf("invalid executing message %d: %w", len(executingMessages), err)
+			}
+			executingMessages = append(executingMessages, msg)
+		}
+	}
+	if len(executingMessages) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		return errors.New("need RPC context to check executing messages")
+	}
+	return b.CheckMessages(ctx, executingMessages, interoptypes.CrossUnsafe)
 }
 
 func (miner *Miner) commitTransactions(env *environment, plainTxs, blobTxs *transactionsByPriceAndNonce, interrupt *atomic.Int32) error {
@@ -422,6 +458,8 @@ func (miner *Miner) commitTransactions(env *environment, plainTxs, blobTxs *tran
 			log.Trace("Skipping transaction with low nonce", "hash", ltx.Hash, "sender", from, "nonce", tx.Nonce())
 			txs.Shift()
 
+		case env.rpcCtx != nil && env.rpcCtx.Err() != nil && errors.Is(err, env.rpcCtx.Err()):
+			return errBlockInterruptedByTimeout // RPC timeout. Tx could not be checked.
 		case errors.Is(err, nil):
 			// Everything ok, collect the logs and shift in the next transaction from the same account
 			txs.Shift()
