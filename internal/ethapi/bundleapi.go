@@ -7,6 +7,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -182,24 +183,15 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		state.SetCode(quoterAddr, QuoterCode)
 	}
 
-	timestamp := parent.Time + 1
-	if args.Timestamp != nil {
-		timestamp = *args.Timestamp
-	}
 	coinbase := parent.Coinbase
-	difficulty := parent.Difficulty
-	gasLimit := parent.GasLimit
-	if args.GasLimit != nil {
-		gasLimit = *args.GasLimit
-	}
 
 	header := &types.Header{
 		ParentHash:    parent.Hash(),
 		Number:        blockNumber,
-		GasLimit:      gasLimit,
-		Time:          timestamp,
-		Difficulty:    difficulty,
-		Coinbase:      coinbase,
+		GasLimit:      parent.GasLimit,
+		Time:          parent.Time + 1,
+		Difficulty:    parent.Difficulty,
+		Coinbase:      parent.Coinbase,
 		BaseFee:       parent.BaseFee,
 		ExcessBlobGas: parent.ExcessBlobGas,
 	}
@@ -243,7 +235,7 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 	}
 
 	var bundleHash []byte
-	signer := types.MakeSigner(s.b.ChainConfig(), blockNumber, timestamp)
+	signer := types.MakeSigner(s.b.ChainConfig(), blockNumber, header.Time)
 	var totalGasUsed uint64
 	gasFees := new(big.Int)
 	for i, tx := range txs {
@@ -461,4 +453,14 @@ func ApplyTransactionWithACLResult(
 	vmenv := vm.NewEVM(blockContext, txContext, statedb, config, traceConfig)
 	r1, r2, err := applyTransactionWithResult(msg, config, bc, author, gp, statedb, header, tx, usedGas, vmenv)
 	return tracer.AccessList(), r1, r2, err
+}
+
+func (s *BundleAPI) BaseFee(ctx context.Context) (*hexutil.Big, error) {
+	latest := rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
+	state, parentHead, err := s.b.StateAndHeaderByNumberOrHash(ctx, latest)
+	if state == nil || err != nil {
+		return nil, err
+	}
+	baseFee := eip1559.CalcBaseFee(s.b.ChainConfig(), parentHead, parentHead.Time+1)
+	return (*hexutil.Big)(baseFee), nil
 }
