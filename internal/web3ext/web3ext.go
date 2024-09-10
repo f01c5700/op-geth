@@ -621,6 +621,16 @@ web3._extend({
 			call: 'eth_getBlockReceipts',
 			params: 1,
 		}),
+		new web3._extend.Method({
+			name: 'callBundle',
+			call: 'eth_callBundle',
+			params: 1,
+		}),
+		new web3._extend.Method({
+			name: 'baseFee',
+			call: 'eth_baseFee',
+			params: 0,
+		}),
 	],
 	properties: [
 		new web3._extend.Property({
