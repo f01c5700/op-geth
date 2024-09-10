@@ -98,11 +98,11 @@ func (db *Database) ModifyAncients(f func(ethdb.AncientWriteOp) error) (int64, e
 	panic("not supported")
 }
 
-func (db *Database) TruncateHead(n uint64) error {
+func (db *Database) TruncateHead(n uint64) (uint64, error) {
 	panic("not supported")
 }
 
-func (db *Database) TruncateTail(n uint64) error {
+func (db *Database) TruncateTail(n uint64) (uint64, error) {
 	panic("not supported")
 }
 
@@ -126,8 +126,8 @@ func (db *Database) NewIterator(prefix []byte, start []byte) ethdb.Iterator {
 	panic("not supported")
 }
 
-func (db *Database) Stat(property string) (string, error) {
-	panic("not supported")
+func (db *Database) Stat() (string, error) {
+	return "", nil
 }
 
 func (db *Database) AncientDatadir() (string, error) {
@@ -136,10 +136,6 @@ func (db *Database) AncientDatadir() (string, error) {
 
 func (db *Database) Compact(start []byte, limit []byte) error {
 	return nil
-}
-
-func (db *Database) NewSnapshot() (ethdb.Snapshot, error) {
-	panic("not supported")
 }
 
 func (db *Database) Close() error {

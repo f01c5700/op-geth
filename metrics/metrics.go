@@ -9,7 +9,9 @@ import (
 	"os"
 	"runtime/metrics"
 	"runtime/pprof"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/log"
@@ -22,21 +24,24 @@ import (
 // for less cluttered pprof profiles.
 var Enabled = false
 
-// EnabledExpensive is a soft-flag meant for external packages to check if costly
-// metrics gathering is allowed or not. The goal is to separate standard metrics
-// for health monitoring and debug metrics that might impact runtime performance.
-var EnabledExpensive = false
-
 // enablerFlags is the CLI flag names to use to enable metrics collections.
 var enablerFlags = []string{"metrics"}
 
-// expensiveEnablerFlags is the CLI flag names to use to enable metrics collections.
-var expensiveEnablerFlags = []string{"metrics.expensive"}
+// enablerEnvVars is the env var names to use to enable metrics collections.
+var enablerEnvVars = []string{"GETH_METRICS"}
 
-// Init enables or disables the metrics system. Since we need this to run before
+// init enables or disables the metrics system. Since we need this to run before
 // any other code gets to create meters and timers, we'll actually do an ugly hack
 // and peek into the command line args for the metrics flag.
 func init() {
+	for _, enabler := range enablerEnvVars {
+		if val, found := syscall.Getenv(enabler); found && !Enabled {
+			if enable, _ := strconv.ParseBool(val); enable { // ignore error, flag parser will choke on it later
+				log.Info("Enabling metrics collection")
+				Enabled = true
+			}
+		}
+	}
 	for _, arg := range os.Args {
 		flag := strings.TrimLeft(arg, "-")
 
@@ -44,12 +49,6 @@ func init() {
 			if !Enabled && flag == enabler {
 				log.Info("Enabling metrics collection")
 				Enabled = true
-			}
-		}
-		for _, enabler := range expensiveEnablerFlags {
-			if !EnabledExpensive && flag == enabler {
-				log.Info("Enabling expensive metrics collection")
-				EnabledExpensive = true
 			}
 		}
 	}
@@ -83,6 +82,12 @@ var runtimeSamples = []metrics.Sample{
 	{Name: "/memory/classes/heap/unused:bytes"},
 	{Name: "/sched/goroutines:goroutines"},
 	{Name: "/sched/latencies:seconds"}, // histogram
+}
+
+func ReadRuntimeStats() *runtimeStats {
+	r := new(runtimeStats)
+	readRuntimeStats(r)
+	return r
 }
 
 func readRuntimeStats(v *runtimeStats) {
@@ -144,6 +149,9 @@ func CollectProcessMetrics(refresh time.Duration) {
 		cpuSysLoad            = GetOrRegisterGauge("system/cpu/sysload", DefaultRegistry)
 		cpuSysWait            = GetOrRegisterGauge("system/cpu/syswait", DefaultRegistry)
 		cpuProcLoad           = GetOrRegisterGauge("system/cpu/procload", DefaultRegistry)
+		cpuSysLoadTotal       = GetOrRegisterCounterFloat64("system/cpu/sysload/total", DefaultRegistry)
+		cpuSysWaitTotal       = GetOrRegisterCounterFloat64("system/cpu/syswait/total", DefaultRegistry)
+		cpuProcLoadTotal      = GetOrRegisterCounterFloat64("system/cpu/procload/total", DefaultRegistry)
 		cpuThreads            = GetOrRegisterGauge("system/cpu/threads", DefaultRegistry)
 		cpuGoroutines         = GetOrRegisterGauge("system/cpu/goroutines", DefaultRegistry)
 		cpuSchedLatency       = getOrRegisterRuntimeHistogram("system/cpu/schedlatency", secondsToNs, nil)
@@ -172,13 +180,17 @@ func CollectProcessMetrics(refresh time.Duration) {
 		secondsSinceLastCollect := collectTime.Sub(lastCollectTime).Seconds()
 		lastCollectTime = collectTime
 		if secondsSinceLastCollect > 0 {
-			sysLoad := (cpustats[now].GlobalTime - cpustats[prev].GlobalTime) / secondsSinceLastCollect
-			sysWait := (cpustats[now].GlobalWait - cpustats[prev].GlobalWait) / secondsSinceLastCollect
-			procLoad := (cpustats[now].LocalTime - cpustats[prev].LocalTime) / secondsSinceLastCollect
+			sysLoad := cpustats[now].GlobalTime - cpustats[prev].GlobalTime
+			sysWait := cpustats[now].GlobalWait - cpustats[prev].GlobalWait
+			procLoad := cpustats[now].LocalTime - cpustats[prev].LocalTime
 			// Convert to integer percentage.
-			cpuSysLoad.Update(int64(sysLoad * 100))
-			cpuSysWait.Update(int64(sysWait * 100))
-			cpuProcLoad.Update(int64(procLoad * 100))
+			cpuSysLoad.Update(int64(sysLoad / secondsSinceLastCollect * 100))
+			cpuSysWait.Update(int64(sysWait / secondsSinceLastCollect * 100))
+			cpuProcLoad.Update(int64(procLoad / secondsSinceLastCollect * 100))
+			// increment counters (ms)
+			cpuSysLoadTotal.Inc(sysLoad)
+			cpuSysWaitTotal.Inc(sysWait)
+			cpuProcLoadTotal.Inc(procLoad)
 		}
 
 		// Threads

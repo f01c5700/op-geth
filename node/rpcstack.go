@@ -19,6 +19,7 @@ package node
 import (
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -41,15 +42,22 @@ type httpConfig struct {
 	CorsAllowedOrigins []string
 	Vhosts             []string
 	prefix             string // path prefix on which to mount http handler
-	jwtSecret          []byte // optional JWT secret
+	rpcEndpointConfig
 }
 
 // wsConfig is the JSON-RPC/Websocket configuration
 type wsConfig struct {
-	Origins   []string
-	Modules   []string
-	prefix    string // path prefix on which to mount ws handler
-	jwtSecret []byte // optional JWT secret
+	Origins []string
+	Modules []string
+	prefix  string // path prefix on which to mount ws handler
+	rpcEndpointConfig
+}
+
+type rpcEndpointConfig struct {
+	jwtSecret              []byte // optional JWT secret
+	batchItemLimit         int
+	batchResponseSizeLimit int
+	httpBodyLimit          int
 }
 
 type rpcHandler struct {
@@ -106,7 +114,7 @@ func (h *httpServer) setListenAddr(host string, port int) error {
 	}
 
 	h.host, h.port = host, port
-	h.endpoint = fmt.Sprintf("%s:%d", host, port)
+	h.endpoint = net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	return nil
 }
 
@@ -292,11 +300,15 @@ func (h *httpServer) enableRPC(apis []rpc.API, config httpConfig) error {
 	defer h.mu.Unlock()
 
 	if h.rpcAllowed() {
-		return fmt.Errorf("JSON-RPC over HTTP is already enabled")
+		return errors.New("JSON-RPC over HTTP is already enabled")
 	}
 
 	// Create RPC server and handler.
 	srv := rpc.NewServer()
+	srv.SetBatchLimits(config.batchItemLimit, config.batchResponseSizeLimit)
+	if config.httpBodyLimit > 0 {
+		srv.SetHTTPBodyLimit(config.httpBodyLimit)
+	}
 	if err := RegisterApis(apis, config.Modules, srv); err != nil {
 		return err
 	}
@@ -324,10 +336,14 @@ func (h *httpServer) enableWS(apis []rpc.API, config wsConfig) error {
 	defer h.mu.Unlock()
 
 	if h.wsAllowed() {
-		return fmt.Errorf("JSON-RPC over WebSocket is already enabled")
+		return errors.New("JSON-RPC over WebSocket is already enabled")
 	}
 	// Create RPC server and handler.
 	srv := rpc.NewServer()
+	srv.SetBatchLimits(config.batchItemLimit, config.batchResponseSizeLimit)
+	if config.httpBodyLimit > 0 {
+		srv.SetHTTPBodyLimit(config.httpBodyLimit)
+	}
 	if err := RegisterApis(apis, config.Modules, srv); err != nil {
 		return err
 	}
@@ -581,7 +597,7 @@ func newIPCServer(log log.Logger, endpoint string) *ipcServer {
 	return &ipcServer{log: log, endpoint: endpoint}
 }
 
-// Start starts the httpServer's http.Server
+// start starts the httpServer's http.Server
 func (is *ipcServer) start(apis []rpc.API) error {
 	is.mu.Lock()
 	defer is.mu.Unlock()

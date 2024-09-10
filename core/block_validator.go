@@ -17,10 +17,13 @@
 package core
 
 import (
+	"errors"
 	"fmt"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/stateless"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
@@ -33,14 +36,12 @@ import (
 type BlockValidator struct {
 	config *params.ChainConfig // Chain configuration options
 	bc     *BlockChain         // Canonical block chain
-	engine consensus.Engine    // Consensus engine used for validating
 }
 
 // NewBlockValidator returns a new block validator which is safe for re-use
-func NewBlockValidator(config *params.ChainConfig, blockchain *BlockChain, engine consensus.Engine) *BlockValidator {
+func NewBlockValidator(config *params.ChainConfig, blockchain *BlockChain) *BlockValidator {
 	validator := &BlockValidator{
 		config: config,
-		engine: engine,
 		bc:     blockchain,
 	}
 	return validator
@@ -58,7 +59,7 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	// Header validity is known at this point. Here we verify that uncles, transactions
 	// and withdrawals given in the block body match the header.
 	header := block.Header()
-	if err := v.engine.VerifyUncles(v.bc, block); err != nil {
+	if err := v.bc.engine.VerifyUncles(v.bc, block); err != nil {
 		return err
 	}
 	if hash := types.CalcUncleHash(block.Uncles()); hash != header.UncleHash {
@@ -67,20 +68,48 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 	if hash := types.DeriveSha(block.Transactions(), trie.NewStackTrie(nil)); hash != header.TxHash {
 		return fmt.Errorf("transaction root hash mismatch (header value %x, calculated %x)", header.TxHash, hash)
 	}
+
 	// Withdrawals are present after the Shanghai fork.
 	if header.WithdrawalsHash != nil {
 		// Withdrawals list must be present in body after Shanghai.
 		if block.Withdrawals() == nil {
-			return fmt.Errorf("missing withdrawals in block body")
+			return errors.New("missing withdrawals in block body")
 		}
 		if hash := types.DeriveSha(block.Withdrawals(), trie.NewStackTrie(nil)); hash != *header.WithdrawalsHash {
 			return fmt.Errorf("withdrawals root hash mismatch (header value %x, calculated %x)", *header.WithdrawalsHash, hash)
 		}
 	} else if block.Withdrawals() != nil {
-		// Withdrawals are not allowed prior to shanghai fork
-		return fmt.Errorf("withdrawals present in block body")
+		// Withdrawals are not allowed prior to Shanghai fork
+		return errors.New("withdrawals present in block body")
 	}
 
+	// Blob transactions may be present after the Cancun fork.
+	var blobs int
+	for i, tx := range block.Transactions() {
+		// Count the number of blobs to validate against the header's blobGasUsed
+		blobs += len(tx.BlobHashes())
+
+		// If the tx is a blob tx, it must NOT have a sidecar attached to be valid in a block.
+		if tx.BlobTxSidecar() != nil {
+			return fmt.Errorf("unexpected blob sidecar in transaction at index %d", i)
+		}
+
+		// The individual checks for blob validity (version-check + not empty)
+		// happens in StateTransition.
+	}
+
+	// Check blob gas usage.
+	if header.BlobGasUsed != nil {
+		if want := *header.BlobGasUsed / params.BlobTxBlobGasPerBlob; uint64(blobs) != want { // div because the header is surely good vs the body might be bloated
+			return fmt.Errorf("blob gas used mismatch (header %v, calculated %v)", *header.BlobGasUsed, blobs*params.BlobTxBlobGasPerBlob)
+		}
+	} else {
+		if blobs > 0 {
+			return errors.New("data blobs present in block body")
+		}
+	}
+
+	// Ancestor block must be known.
 	if !v.bc.HasBlockAndState(block.ParentHash(), block.NumberU64()-1) {
 		if !v.bc.HasBlock(block.ParentHash(), block.NumberU64()-1) {
 			return consensus.ErrUnknownAncestor
@@ -92,7 +121,7 @@ func (v *BlockValidator) ValidateBody(block *types.Block) error {
 
 // ValidateState validates the various changes that happen after a state transition,
 // such as amount of used gas, the receipt roots and the state root itself.
-func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateDB, receipts types.Receipts, usedGas uint64) error {
+func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateDB, receipts types.Receipts, usedGas uint64, stateless bool) error {
 	header := block.Header()
 	if block.GasUsed() != usedGas {
 		return fmt.Errorf("invalid gas used (remote: %d local: %d)", block.GasUsed(), usedGas)
@@ -103,7 +132,12 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	if rbloom != header.Bloom {
 		return fmt.Errorf("invalid bloom (remote: %x  local: %x)", header.Bloom, rbloom)
 	}
-	// Tre receipt Trie's root (R = (Tr [[H1, R1], ... [Hn, Rn]]))
+	// In stateless mode, return early because the receipt and state root are not
+	// provided through the witness, rather the cross validator needs to return it.
+	if stateless {
+		return nil
+	}
+	// The receipt Trie's root (R = (Tr [[H1, R1], ... [Hn, Rn]]))
 	receiptSha := types.DeriveSha(receipts, trie.NewStackTrie(nil))
 	if receiptSha != header.ReceiptHash {
 		return fmt.Errorf("invalid receipt root hash (remote: %x local: %x)", header.ReceiptHash, receiptSha)
@@ -112,6 +146,28 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	// an error if they don't match.
 	if root := statedb.IntermediateRoot(v.config.IsEIP158(header.Number)); header.Root != root {
 		return fmt.Errorf("invalid merkle root (remote: %x local: %x) dberr: %w", header.Root, root, statedb.Error())
+	}
+	return nil
+}
+
+// ValidateWitness cross validates a block execution with stateless remote clients.
+//
+// Normally we'd distribute the block witness to remote cross validators, wait
+// for them to respond and then merge the results. For now, however, it's only
+// Geth, so do an internal stateless run.
+func (v *BlockValidator) ValidateWitness(witness *stateless.Witness, receiptRoot common.Hash, stateRoot common.Hash) error {
+	// Run the cross client stateless execution
+	// TODO(karalabe): Self-stateless for now, swap with other clients
+	crossReceiptRoot, crossStateRoot, err := ExecuteStateless(v.config, witness)
+	if err != nil {
+		return fmt.Errorf("stateless execution failed: %v", err)
+	}
+	// Stateless cross execution suceeeded, validate the withheld computed fields
+	if crossReceiptRoot != receiptRoot {
+		return fmt.Errorf("cross validator receipt root mismatch (cross: %x local: %x)", crossReceiptRoot, receiptRoot)
+	}
+	if crossStateRoot != stateRoot {
+		return fmt.Errorf("cross validator state root mismatch (cross: %x local: %x)", crossStateRoot, stateRoot)
 	}
 	return nil
 }

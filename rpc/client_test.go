@@ -169,10 +169,12 @@ func TestClientBatchRequest(t *testing.T) {
 	}
 }
 
+// This checks that, for HTTP connections, the length of batch responses is validated to
+// match the request exactly.
 func TestClientBatchRequest_len(t *testing.T) {
 	b, err := json.Marshal([]jsonrpcMessage{
-		{Version: "2.0", ID: json.RawMessage("1"), Method: "foo", Result: json.RawMessage(`"0x1"`)},
-		{Version: "2.0", ID: json.RawMessage("2"), Method: "bar", Result: json.RawMessage(`"0x2"`)},
+		{Version: "2.0", ID: json.RawMessage("1"), Result: json.RawMessage(`"0x1"`)},
+		{Version: "2.0", ID: json.RawMessage("2"), Result: json.RawMessage(`"0x2"`)},
 	})
 	if err != nil {
 		t.Fatal("failed to encode jsonrpc message:", err)
@@ -185,35 +187,101 @@ func TestClientBatchRequest_len(t *testing.T) {
 	}))
 	t.Cleanup(s.Close)
 
-	client, err := Dial(s.URL)
-	if err != nil {
-		t.Fatal("failed to dial test server:", err)
-	}
-	defer client.Close()
-
 	t.Run("too-few", func(t *testing.T) {
+		client, err := Dial(s.URL)
+		if err != nil {
+			t.Fatal("failed to dial test server:", err)
+		}
+		defer client.Close()
+
 		batch := []BatchElem{
-			{Method: "foo"},
-			{Method: "bar"},
-			{Method: "baz"},
+			{Method: "foo", Result: new(string)},
+			{Method: "bar", Result: new(string)},
+			{Method: "baz", Result: new(string)},
 		}
 		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
 		defer cancelFn()
-		if err := client.BatchCallContext(ctx, batch); !errors.Is(err, ErrBadResult) {
-			t.Errorf("expected %q but got: %v", ErrBadResult, err)
+
+		if err := client.BatchCallContext(ctx, batch); err != nil {
+			t.Fatal("error:", err)
+		}
+		for i, elem := range batch[:2] {
+			if elem.Error != nil {
+				t.Errorf("expected no error for batch element %d, got %q", i, elem.Error)
+			}
+		}
+		for i, elem := range batch[2:] {
+			if elem.Error != ErrMissingBatchResponse {
+				t.Errorf("wrong error %q for batch element %d", elem.Error, i+2)
+			}
 		}
 	})
 
 	t.Run("too-many", func(t *testing.T) {
+		client, err := Dial(s.URL)
+		if err != nil {
+			t.Fatal("failed to dial test server:", err)
+		}
+		defer client.Close()
+
 		batch := []BatchElem{
-			{Method: "foo"},
+			{Method: "foo", Result: new(string)},
 		}
 		ctx, cancelFn := context.WithTimeout(context.Background(), time.Second)
 		defer cancelFn()
-		if err := client.BatchCallContext(ctx, batch); !errors.Is(err, ErrBadResult) {
-			t.Errorf("expected %q but got: %v", ErrBadResult, err)
+
+		if err := client.BatchCallContext(ctx, batch); err != nil {
+			t.Fatal("error:", err)
+		}
+		for i, elem := range batch[:1] {
+			if elem.Error != nil {
+				t.Errorf("expected no error for batch element %d, got %q", i, elem.Error)
+			}
+		}
+		for i, elem := range batch[1:] {
+			if elem.Error != ErrMissingBatchResponse {
+				t.Errorf("wrong error %q for batch element %d", elem.Error, i+2)
+			}
 		}
 	})
+}
+
+// This checks that the client can handle the case where the server doesn't
+// respond to all requests in a batch.
+func TestClientBatchRequestLimit(t *testing.T) {
+	server := newTestServer()
+	defer server.Stop()
+	server.SetBatchLimits(2, 100000)
+	client := DialInProc(server)
+	defer client.Close()
+
+	batch := []BatchElem{
+		{Method: "foo"},
+		{Method: "bar"},
+		{Method: "baz"},
+	}
+	err := client.BatchCall(batch)
+	if err != nil {
+		t.Fatal("unexpected error:", err)
+	}
+
+	// Check that the first response indicates an error with batch size.
+	var err0 Error
+	if !errors.As(batch[0].Error, &err0) {
+		t.Log("error zero:", batch[0].Error)
+		t.Fatalf("batch elem 0 has wrong error type: %T", batch[0].Error)
+	} else {
+		if err0.ErrorCode() != -32600 || err0.Error() != errMsgBatchTooLarge {
+			t.Fatalf("wrong error on batch elem zero: %v", err0)
+		}
+	}
+
+	// Check that remaining response batch elements are reported as absent.
+	for i, elem := range batch[1:] {
+		if elem.Error != ErrMissingBatchResponse {
+			t.Fatalf("batch elem %d has unexpected error: %v", i+1, elem.Error)
+		}
+	}
 }
 
 func TestClientNotify(t *testing.T) {
@@ -275,6 +343,7 @@ func testClientCancel(transport string, t *testing.T) {
 	default:
 		panic("unknown transport: " + transport)
 	}
+	defer client.Close()
 
 	// The actual test starts here.
 	var (
@@ -310,7 +379,7 @@ func testClientCancel(transport string, t *testing.T) {
 				_, hasDeadline := ctx.Deadline()
 				t.Errorf("no error for call with %v wait time (deadline: %v)", timeout, hasDeadline)
 				// default:
-				// 	t.Logf("got expected error with %v wait time: %v", timeout, err)
+				//	t.Logf("got expected error with %v wait time: %v", timeout, err)
 			}
 			cancel()
 		}
@@ -487,7 +556,8 @@ func TestClientSubscriptionUnsubscribeServer(t *testing.T) {
 	defer srv.Stop()
 
 	// Create the client on the other end of the pipe.
-	client, _ := newClient(context.Background(), func(context.Context) (ServerCodec, error) {
+	cfg := new(clientConfig)
+	client, _ := newClient(context.Background(), cfg, func(context.Context) (ServerCodec, error) {
 		return NewCodec(p2), nil
 	})
 	defer client.Close()
@@ -517,17 +587,18 @@ func TestClientSubscriptionChannelClose(t *testing.T) {
 	var (
 		srv     = NewServer()
 		httpsrv = httptest.NewServer(srv.WebsocketHandler(nil))
-		wsURL   = "ws:" + strings.TrimPrefix(httpsrv.URL, "http:")
+		wsURL   = "ws:" + strings.TrimPrefix(httpsrv.URL, "http:") //nolint:all
 	)
 	defer srv.Stop()
 	defer httpsrv.Close()
 
 	srv.RegisterName("nftest", new(notificationTestService))
 	client, _ := Dial(wsURL)
+	defer client.Close()
 
 	for i := 0; i < 100; i++ {
 		ch := make(chan int, 100)
-		sub, err := client.Subscribe(context.Background(), "nftest", ch, "someSubscription", maxClientSubscriptionBuffer-1, 1)
+		sub, err := client.Subscribe(context.Background(), "nftest", ch, "someSubscription", 100, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -640,7 +711,6 @@ func TestClientHTTP(t *testing.T) {
 		errc       = make(chan error, len(results))
 		wantResult = echoResult{"a", 1, new(echoArgs)}
 	)
-	defer client.Close()
 	for i := range results {
 		i := i
 		go func() {

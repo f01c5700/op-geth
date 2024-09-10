@@ -28,12 +28,13 @@ import (
 
 var (
 	// These flags override values in build env.
-	GitCommitFlag   = flag.String("git-commit", "", `Overrides git commit hash embedded into executables`)
-	GitBranchFlag   = flag.String("git-branch", "", `Overrides git branch being built`)
-	GitTagFlag      = flag.String("git-tag", "", `Overrides git tag being built`)
-	BuildnumFlag    = flag.String("buildnum", "", `Overrides CI build number`)
-	PullRequestFlag = flag.Bool("pull-request", false, `Overrides pull request status of the build`)
-	CronJobFlag     = flag.Bool("cron-job", false, `Overrides cron job status of the build`)
+	GitCommitFlag     = flag.String("git-commit", "", `Overrides git commit hash embedded into executables`)
+	GitBranchFlag     = flag.String("git-branch", "", `Overrides git branch being built`)
+	GitTagFlag        = flag.String("git-tag", "", `Overrides git tag being built`)
+	BuildnumFlag      = flag.String("buildnum", "", `Overrides CI build number`)
+	PullRequestFlag   = flag.Bool("pull-request", false, `Overrides pull request status of the build`)
+	CronJobFlag       = flag.Bool("cron-job", false, `Overrides cron job status of the build`)
+	UbuntuVersionFlag = flag.String("ubuntu", "", `Sets the ubuntu version being built for`)
 )
 
 // Environment contains metadata provided by the build environment.
@@ -43,6 +44,7 @@ type Environment struct {
 	Repo                      string // name of GitHub repo
 	Commit, Date, Branch, Tag string // Git info
 	Buildnum                  string
+	UbuntuVersion             string // Ubuntu version being built for
 	IsPullRequest             bool
 	IsCronJob                 bool
 }
@@ -100,6 +102,10 @@ func LocalEnv() Environment {
 	env := applyEnvFlags(Environment{Name: "local", Repo: "ethereum/go-ethereum"})
 
 	head := readGitFile("HEAD")
+	if info, err := os.Stat(".git/objects"); err == nil && info.IsDir() && env.Tag == "" {
+		env.Tag = firstLine(RunGit("tag", "-l", "--points-at", "HEAD"))
+	}
+
 	if fields := strings.Fields(head); len(fields) == 2 {
 		head = fields[1]
 	} else {
@@ -109,6 +115,7 @@ func LocalEnv() Environment {
 		commitRe, _ := regexp.Compile("^([0-9a-f]{40})$")
 		if commit := commitRe.FindString(head); commit != "" && env.Commit == "" {
 			env.Commit = commit
+			env.Date = getDate(env.Commit)
 		}
 		return env
 	}
@@ -120,9 +127,6 @@ func LocalEnv() Environment {
 		if head != "HEAD" {
 			env.Branch = strings.TrimPrefix(head, "refs/heads/")
 		}
-	}
-	if info, err := os.Stat(".git/objects"); err == nil && info.IsDir() && env.Tag == "" {
-		env.Tag = firstLine(RunGit("tag", "-l", "--points-at", "HEAD"))
 	}
 	return env
 }
@@ -167,6 +171,9 @@ func applyEnvFlags(env Environment) Environment {
 	}
 	if *CronJobFlag {
 		env.IsCronJob = true
+	}
+	if *UbuntuVersionFlag != "" {
+		env.UbuntuVersion = *UbuntuVersionFlag
 	}
 	return env
 }
