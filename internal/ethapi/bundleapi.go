@@ -8,6 +8,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
+	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -185,6 +186,7 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 
 	coinbase := parent.Coinbase
 
+	exBlobGas := eip4844.CalcExcessBlobGas(*parent.ExcessBlobGas, *parent.BlobGasUsed)
 	header := &types.Header{
 		ParentHash:    parent.Hash(),
 		Number:        blockNumber,
@@ -192,8 +194,8 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		Time:          parent.Time + 1,
 		Difficulty:    parent.Difficulty,
 		Coinbase:      parent.Coinbase,
-		BaseFee:       parent.BaseFee,
-		ExcessBlobGas: parent.ExcessBlobGas,
+		BaseFee:       eip1559.CalcBaseFee(s.b.ChainConfig(), parent, parent.Time+2),
+		ExcessBlobGas: &exBlobGas,
 	}
 
 	vmconfig := vm.Config{}
