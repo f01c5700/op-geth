@@ -42,6 +42,7 @@ func DoCallWithStateDB(ctx context.Context, b Backend, args TransactionArgs, sta
 	defer cancel()
 
 	// Get a new instance of the EVM.
+	args.GasPrice = (*hexutil.Big)(header.BaseFee)
 	msg := args.ToMessage(header.BaseFee)
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil, b.ChainConfig(), state)
 	evm := b.GetEVM(ctx, msg, state, header, &vm.Config{NoBaseFee: true}, &blockCtx)
@@ -191,7 +192,7 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 		ParentHash:    parent.Hash(),
 		Number:        blockNumber,
 		GasLimit:      parent.GasLimit,
-		Time:          parent.Time + 1,
+		Time:          parent.Time + 2,
 		Difficulty:    parent.Difficulty,
 		Coinbase:      parent.Coinbase,
 		BaseFee:       eip1559.CalcBaseFee(s.b.ChainConfig(), parent, parent.Time+2),
@@ -215,6 +216,7 @@ func (s *BundleAPI) CallBundle(ctx context.Context, args CallBundleArgs) (map[st
 				results = append(results, map[string]interface{}{})
 				continue
 			}
+
 			result, err := DoCallWithStateDB(ctx, s.b, *call, state, header, s.b.RPCEVMTimeout(), s.b.RPCGasCap())
 			if err != nil {
 				return nil, err
@@ -463,6 +465,6 @@ func (s *BundleAPI) BaseFee(ctx context.Context) (*hexutil.Big, error) {
 	if state == nil || err != nil {
 		return nil, err
 	}
-	baseFee := eip1559.CalcBaseFee(s.b.ChainConfig(), parentHead, parentHead.Time+1)
+	baseFee := eip1559.CalcBaseFee(s.b.ChainConfig(), parentHead, parentHead.Time+2)
 	return (*hexutil.Big)(baseFee), nil
 }
