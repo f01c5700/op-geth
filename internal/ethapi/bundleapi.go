@@ -43,6 +43,7 @@ func DoCallWithStateDB(ctx context.Context, b Backend, args TransactionArgs, sta
 
 	// Get a new instance of the EVM.
 	args.GasPrice = (*hexutil.Big)(header.BaseFee)
+	err := args.CallDefaults(b.RPCGasCap(), header.BaseFee, b.ChainConfig().ChainID)
 	msg := args.ToMessage(header.BaseFee)
 	blockCtx := core.NewEVMBlockContext(header, NewChainContext(ctx, b), nil, b.ChainConfig(), state)
 	evm := b.GetEVM(ctx, msg, state, header, &vm.Config{NoBaseFee: true}, &blockCtx)
